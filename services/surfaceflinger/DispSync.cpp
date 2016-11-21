@@ -412,6 +412,9 @@ void DispSync::reset() {
     mNumResyncSamples = 0;
     mFirstResyncSample = 0;
     mNumResyncSamplesSincePresent = 0;
+#ifdef HH_VSYNC_ISSUE
+    mNumPresentWithoutResyncSamples = 0;
+#endif
     resetErrorLocked();
 }
 
@@ -436,6 +439,17 @@ bool DispSync::addPresentFence(const sp<Fence>& fence) {
 
     updateErrorLocked();
 
+#ifdef HH_VSYNC_ISSUE
+    // This is a workaround for b/25845510.
+    // If we have no resync samples after many presents, something is wrong with
+    // HW vsync. Tell SF to disable HW vsync now and re-enable it next time.
+    if (mNumResyncSamples == 0 &&
+        mNumPresentWithoutResyncSamples++ > MAX_PRESENT_WITHOUT_RESYNC_SAMPLES) {
+        mNumPresentWithoutResyncSamples = 0;
+        return false;
+    }
+#endif
+
     return !mModelUpdated || mError > kErrorThreshold;
 }
 
@@ -444,6 +458,9 @@ void DispSync::beginResync() {
     ALOGV("[%s] beginResync", mName);
     mModelUpdated = false;
     mNumResyncSamples = 0;
+#ifdef HH_VSYNC_ISSUE
+    mNumPresentWithoutResyncSamples = 0;
+#endif
 }
 
 bool DispSync::addResyncSample(nsecs_t timestamp) {
