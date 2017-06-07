@@ -70,6 +70,7 @@
 #include "EventThread.h"
 #include "Layer.h"
 #include "LayerDim.h"
+#include "LayerBlur.h"
 #include "SurfaceFlinger.h"
 
 #include "DisplayHardware/FramebufferSurface.h"
@@ -80,6 +81,10 @@
 
 #include "RenderEngine/RenderEngine.h"
 #include <cutils/compiler.h>
+
+#ifdef USES_HWC_SERVICES
+#include "ExynosHWCService.h"
+#endif
 
 #define DISPLAY_COUNT       1
 
@@ -127,6 +132,10 @@ const String16 sDump("android.permission.DUMP");
 
 // ---------------------------------------------------------------------------
 
+#ifdef USES_HWC_SERVICES
+static bool notifyPSRExit = true;
+#endif
+
 SurfaceFlinger::SurfaceFlinger()
     :   BnSurfaceComposer(),
         mTransactionFlags(0),
@@ -157,7 +166,8 @@ SurfaceFlinger::SurfaceFlinger()
         mHasPoweredOff(false),
         mFrameBuckets(),
         mTotalTime(0),
-        mLastSwapTime(0)
+        mLastSwapTime(0),
+        mActiveFrameSequence(0)
 {
     ALOGI("SurfaceFlinger is starting");
 
@@ -312,6 +322,14 @@ void SurfaceFlinger::bootFinished()
     // formerly we would just kill the process, but we now ask it to exit so it
     // can choose where to stop the animation.
     property_set("service.bootanim.exit", "1");
+
+#ifdef USES_HWC_SERVICES
+    sp<IServiceManager> sm = defaultServiceManager();
+    sp<android::IExynosHWCService> hwc =
+        interface_cast<android::IExynosHWCService>(sm->getService(String16("Exynos.HWCService")));
+    ALOGD("boot finished. Inform HWC");
+    hwc->setBootFinished();
+#endif
 
     const int LOGTAG_SF_STOP_BOOTANIM = 60110;
     LOG_EVENT_LONG(LOGTAG_SF_STOP_BOOTANIM,
@@ -613,10 +631,21 @@ status_t SurfaceFlinger::getDisplayConfigs(const sp<IBinder>& display,
             info.orientation = 0;
         }
 
-        info.w = hwConfig->getWidth();
-        info.h = hwConfig->getHeight();
-        info.xdpi = xdpi;
-        info.ydpi = ydpi;
+        char value[PROPERTY_VALUE_MAX];
+        property_get("ro.sf.hwrotation", value, "0");
+        int additionalRot = atoi(value) / 90;
+        if ((type == DisplayDevice::DISPLAY_PRIMARY) && (additionalRot & DisplayState::eOrientationSwapMask)) {
+            info.h = hwConfig->getWidth();
+            info.w = hwConfig->getHeight();
+            info.xdpi = ydpi;
+            info.ydpi = xdpi;
+        }
+        else {
+            info.w = hwConfig->getWidth();
+            info.h = hwConfig->getHeight();
+            info.xdpi = xdpi;
+            info.ydpi = ydpi;
+        }
         info.fps = 1e9 / hwConfig->getVsyncPeriod();
         info.appVsyncOffset = VSYNC_EVENT_PHASE_OFFSET_NS;
 
@@ -865,6 +894,19 @@ void SurfaceFlinger::signalTransaction() {
 }
 
 void SurfaceFlinger::signalLayerUpdate() {
+#ifdef USES_HWC_SERVICES
+    if (notifyPSRExit) {
+        notifyPSRExit = false;
+        sp<IServiceManager> sm = defaultServiceManager();
+        sp<IExynosHWCService> hwcService =
+            interface_cast<android::IExynosHWCService>(
+                sm->getService(String16("Exynos.HWCService")));
+        if (hwcService != NULL)
+            hwcService->notifyPSRExit();
+        else
+            ALOGE("HWCService::notifyPSRExit failed");
+    }
+#endif
     mEventQueue.invalidate();
 }
 
@@ -1064,6 +1106,9 @@ void SurfaceFlinger::handleMessageRefresh() {
     doDebugFlashRegions();
     doComposition();
     postComposition(refreshStartTime);
+#ifdef USES_HWC_SERVICES
+    notifyPSRExit = true;
+#endif
 
     mPreviousPresentFence = mHwc->getRetireFence(HWC_DISPLAY_PRIMARY);
 
@@ -1377,6 +1422,8 @@ void SurfaceFlinger::doComposition() {
             // repaint the framebuffer (if needed)
             doDisplayComposition(hw, dirtyRegion);
 
+            ++mActiveFrameSequence;
+
             hw->dirtyRegion.clear();
             hw->flip(hw->swapRegion);
             hw->swapRegion.clear();
@@ -1432,6 +1479,7 @@ void SurfaceFlinger::postFramebuffer()
     if (flipCount % LOG_FRAME_STATS_PERIOD == 0) {
         logFrameStats();
     }
+    ALOGV_IF(mFrameRateHelper.update(), "FPS: %d", mFrameRateHelper.get());
 }
 
 void SurfaceFlinger::handleTransaction(uint32_t transactionFlags)
@@ -2406,6 +2454,41 @@ uint32_t SurfaceFlinger::setClientStateLocked(
                 flags |= eTransactionNeeded|eTraversalNeeded;
             }
         }
+        if (what & layer_state_t::eBlurChanged) {
+            ALOGV("eBlurChanged");
+            if (layer->setBlur(uint8_t(255.0f*s.blur+0.5f))) {
+                flags |= eTraversalNeeded;
+            }
+        }
+        if (what & layer_state_t::eBlurMaskSurfaceChanged) {
+            ALOGV("eBlurMaskSurfaceChanged");
+            sp<Layer> maskLayer = 0;
+            if (s.blurMaskSurface != 0) {
+                maskLayer = client->getLayerUser(s.blurMaskSurface);
+            }
+            if (maskLayer == 0) {
+                ALOGV("eBlurMaskSurfaceChanged. maskLayer == 0");
+            } else {
+                ALOGV("eBlurMaskSurfaceChagned. maskLayer.z == %d", maskLayer->getCurrentState().z);
+                if (maskLayer->isBlurLayer()) {
+                    ALOGE("Blur layer can not be used as blur mask surface");
+                    maskLayer = 0;
+                }
+            }
+            if (layer->setBlurMaskLayer(maskLayer)) {
+                flags |= eTraversalNeeded;
+            }
+        }
+        if (what & layer_state_t::eBlurMaskSamplingChanged) {
+            if (layer->setBlurMaskSampling(s.blurMaskSampling)) {
+                flags |= eTraversalNeeded;
+            }
+        }
+        if (what & layer_state_t::eBlurMaskAlphaThresholdChanged) {
+            if (layer->setBlurMaskAlphaThreshold(s.blurMaskAlphaThreshold)) {
+                flags |= eTraversalNeeded;
+            }
+        }
         if (what & layer_state_t::eSizeChanged) {
             if (layer->setSize(s.w, s.h)) {
                 flags |= eTraversalNeeded;
@@ -2488,6 +2571,11 @@ status_t SurfaceFlinger::createLayer(
                     name, w, h, flags,
                     handle, gbp, &layer);
             break;
+        case ISurfaceComposerClient::eFXSurfaceBlur:
+            result = createBlurLayer(client,
+                    name, w, h, flags,
+                    handle, gbp, &layer);
+            break;
         default:
             result = BAD_VALUE;
             break;
@@ -2537,6 +2625,16 @@ status_t SurfaceFlinger::createDimLayer(const sp<Client>& client,
         sp<IBinder>* handle, sp<IGraphicBufferProducer>* gbp, sp<Layer>* outLayer)
 {
     *outLayer = new LayerDim(this, client, name, w, h, flags);
+    *handle = (*outLayer)->getHandle();
+    *gbp = (*outLayer)->getProducer();
+    return NO_ERROR;
+}
+
+status_t SurfaceFlinger::createBlurLayer(const sp<Client>& client,
+        const String8& name, uint32_t w, uint32_t h, uint32_t flags,
+        sp<IBinder>* handle, sp<IGraphicBufferProducer>* gbp, sp<Layer>* outLayer)
+{
+    *outLayer = new LayerBlur(this, client, name, w, h, flags);
     *handle = (*outLayer)->getHandle();
     *gbp = (*outLayer)->getProducer();
     return NO_ERROR;
@@ -3440,7 +3538,8 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
         const sp<IGraphicBufferProducer>& producer,
         Rect sourceCrop, uint32_t reqWidth, uint32_t reqHeight,
         uint32_t minLayerZ, uint32_t maxLayerZ,
-        bool useIdentityTransform, ISurfaceComposer::Rotation rotation) {
+        bool useIdentityTransform, ISurfaceComposer::Rotation rotation,
+        bool useReadPixels) {
 
     if (CC_UNLIKELY(display == 0))
         return BAD_VALUE;
@@ -3494,13 +3593,14 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
                 uint32_t minLayerZ, uint32_t maxLayerZ,
                 bool useIdentityTransform,
                 Transform::orientation_flags rotation,
-                bool isLocalScreenshot)
+                bool isLocalScreenshot, bool useReadPixels)
             : flinger(flinger), display(display), producer(producer),
               sourceCrop(sourceCrop), reqWidth(reqWidth), reqHeight(reqHeight),
               minLayerZ(minLayerZ), maxLayerZ(maxLayerZ),
               useIdentityTransform(useIdentityTransform),
               rotation(rotation), result(PERMISSION_DENIED),
-              isLocalScreenshot(isLocalScreenshot)
+              isLocalScreenshot(isLocalScreenshot),
+              useReadPixels(useReadPixels)
         {
         }
         status_t getResult() const {
@@ -3509,9 +3609,11 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
         virtual bool handler() {
             Mutex::Autolock _l(flinger->mStateLock);
             sp<const DisplayDevice> hw(flinger->getDisplayDevice(display));
+            bool useReadPixels = this->useReadPixels && !flinger->mGpuToCpuSupported;
             result = flinger->captureScreenImplLocked(hw, producer,
                     sourceCrop, reqWidth, reqHeight, minLayerZ, maxLayerZ,
-                    useIdentityTransform, rotation, isLocalScreenshot);
+                    useIdentityTransform, rotation, isLocalScreenshot,
+                    useReadPixels);
             static_cast<GraphicProducerWrapper*>(IInterface::asBinder(producer).get())->exit(result);
             return true;
         }
@@ -3527,7 +3629,8 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
     sp<MessageBase> msg = new MessageCaptureScreen(this,
             display, IGraphicBufferProducer::asInterface( wrapper ),
             sourceCrop, reqWidth, reqHeight, minLayerZ, maxLayerZ,
-            useIdentityTransform, rotationFlags, isLocalScreenshot);
+            useIdentityTransform, rotationFlags, isLocalScreenshot,
+            useReadPixels);
 
     status_t res = postMessageAsync(msg);
     if (res == NO_ERROR) {
@@ -3610,7 +3713,7 @@ status_t SurfaceFlinger::captureScreenImplLocked(
         Rect sourceCrop, uint32_t reqWidth, uint32_t reqHeight,
         uint32_t minLayerZ, uint32_t maxLayerZ,
         bool useIdentityTransform, Transform::orientation_flags rotation,
-        bool isLocalScreenshot)
+        bool isLocalScreenshot, bool useReadPixels)
 {
     ATRACE_CALL();
 
@@ -3627,6 +3730,8 @@ status_t SurfaceFlinger::captureScreenImplLocked(
                 reqWidth, reqHeight, hw_w, hw_h);
         return BAD_VALUE;
     }
+
+    ++mActiveFrameSequence;
 
     reqWidth  = (!reqWidth)  ? hw_w : reqWidth;
     reqHeight = (!reqHeight) ? hw_h : reqHeight;
@@ -3688,7 +3793,8 @@ status_t SurfaceFlinger::captureScreenImplLocked(
                 if (image != EGL_NO_IMAGE_KHR) {
                     // this binds the given EGLImage as a framebuffer for the
                     // duration of this scope.
-                    RenderEngine::BindImageAsFramebuffer imageBond(getRenderEngine(), image);
+                    RenderEngine::BindImageAsFramebuffer imageBond(getRenderEngine(), image,
+                            useReadPixels, reqWidth, reqHeight);
                     if (imageBond.getStatus() == NO_ERROR) {
                         // this will in fact render into our dequeued buffer
                         // via an FBO, which means we didn't have to create
@@ -3733,6 +3839,15 @@ status_t SurfaceFlinger::captureScreenImplLocked(
                                 eglDestroySyncKHR(mEGLDisplay, sync);
                             } else {
                                 ALOGW("captureScreen: error creating EGL fence: %#x", eglGetError());
+                            }
+                        }
+                        if (useReadPixels) {
+                            sp<GraphicBuffer> buf = static_cast<GraphicBuffer*>(buffer);
+                            void* vaddr;
+                            if (buf->lock(GRALLOC_USAGE_SW_WRITE_OFTEN, &vaddr) == NO_ERROR) {
+                                getRenderEngine().readPixels(0, 0, buffer->stride, reqHeight,
+                                        (uint32_t *)vaddr);
+                                buf->unlock();
                             }
                         }
                         if (DEBUG_SCREENSHOTS) {

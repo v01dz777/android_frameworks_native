@@ -150,6 +150,14 @@ public:
             uint32_t w, uint32_t h);
     status_t setLayer(const sp<SurfaceComposerClient>& client, const sp<IBinder>& id,
             uint32_t z);
+    status_t setBlur(const sp<SurfaceComposerClient>& client, const sp<IBinder>& id,
+            float blur);
+    status_t setBlurMaskSurface(const sp<SurfaceComposerClient>& client, const sp<IBinder>& id,
+            const sp<IBinder>& maskSurfaceId);
+    status_t setBlurMaskSampling(const sp<SurfaceComposerClient>& client, const sp<IBinder>& id,
+            uint32_t blurMaskSampling);
+    status_t setBlurMaskAlphaThreshold(const sp<SurfaceComposerClient>& client, const sp<IBinder>& id,
+            float alpha);
     status_t setFlags(const sp<SurfaceComposerClient>& client, const sp<IBinder>& id,
             uint32_t flags, uint32_t mask);
     status_t setTransparentRegionHint(
@@ -317,6 +325,50 @@ status_t Composer::setLayer(const sp<SurfaceComposerClient>& client,
         return BAD_INDEX;
     s->what |= layer_state_t::eLayerChanged;
     s->z = z;
+    return NO_ERROR;
+}
+
+status_t Composer::setBlur(const sp<SurfaceComposerClient>& client,
+        const sp<IBinder>& id, float blur) {
+    Mutex::Autolock _l(mLock);
+    layer_state_t* s = getLayerStateLocked(client, id);
+    if (!s)
+        return BAD_INDEX;
+    s->what |= layer_state_t::eBlurChanged;
+    s->blur = blur;
+    return NO_ERROR;
+}
+
+status_t Composer::setBlurMaskSurface(const sp<SurfaceComposerClient>& client,
+        const sp<IBinder>& id, const sp<IBinder>& maskSurfaceId) {
+    Mutex::Autolock _l(mLock);
+    layer_state_t* s = getLayerStateLocked(client, id);
+    if (!s)
+        return BAD_INDEX;
+    s->what |= layer_state_t::eBlurMaskSurfaceChanged;
+    s->blurMaskSurface = maskSurfaceId;
+    return NO_ERROR;
+}
+
+status_t Composer::setBlurMaskSampling(const sp<SurfaceComposerClient>& client,
+        const sp<IBinder>& id, uint32_t blurMaskSampling) {
+    Mutex::Autolock _l(mLock);
+    layer_state_t* s = getLayerStateLocked(client, id);
+    if (!s)
+        return BAD_INDEX;
+    s->what |= layer_state_t::eBlurMaskSamplingChanged;
+    s->blurMaskSampling = blurMaskSampling;
+    return NO_ERROR;
+}
+
+status_t Composer::setBlurMaskAlphaThreshold(const sp<SurfaceComposerClient>& client,
+        const sp<IBinder>& id, float alpha) {
+    Mutex::Autolock _l(mLock);
+    layer_state_t* s = getLayerStateLocked(client, id);
+    if (!s)
+        return BAD_INDEX;
+    s->what |= layer_state_t::eBlurMaskAlphaThresholdChanged;
+    s->blurMaskAlphaThreshold = alpha;
     return NO_ERROR;
 }
 
@@ -692,6 +744,22 @@ status_t SurfaceComposerClient::setLayer(const sp<IBinder>& id, uint32_t z) {
     return getComposer().setLayer(this, id, z);
 }
 
+status_t SurfaceComposerClient::setBlur(const sp<IBinder>& id, float blur) {
+    return getComposer().setBlur(this, id, blur);
+}
+
+status_t SurfaceComposerClient::setBlurMaskSurface(const sp<IBinder>& id, const sp<IBinder>& maskSurfaceId) {
+    return getComposer().setBlurMaskSurface(this, id, maskSurfaceId);
+}
+
+status_t SurfaceComposerClient::setBlurMaskSampling(const sp<IBinder>& id, uint32_t blurMaskSampling) {
+    return getComposer().setBlurMaskSampling(this, id, blurMaskSampling);
+}
+
+status_t SurfaceComposerClient::setBlurMaskAlphaThreshold(const sp<IBinder>& id, float alpha) {
+    return getComposer().setBlurMaskAlphaThreshold(this, id, alpha);
+}
+
 status_t SurfaceComposerClient::hide(const sp<IBinder>& id) {
     return getComposer().setFlags(this, id,
             layer_state_t::eLayerHidden,
@@ -841,6 +909,12 @@ status_t SurfaceComposerClient::getHdrCapabilities(const sp<IBinder>& display,
 
 // ----------------------------------------------------------------------------
 
+#ifndef FORCE_SCREENSHOT_CPU_PATH
+#define SS_CPU_CONSUMER false
+#else
+#define SS_CPU_CONSUMER true
+#endif
+
 status_t ScreenshotClient::capture(
         const sp<IBinder>& display,
         const sp<IGraphicBufferProducer>& producer,
@@ -849,7 +923,8 @@ status_t ScreenshotClient::capture(
     sp<ISurfaceComposer> s(ComposerService::getComposerService());
     if (s == NULL) return NO_INIT;
     return s->captureScreen(display, producer, sourceCrop,
-            reqWidth, reqHeight, minLayerZ, maxLayerZ, useIdentityTransform);
+            reqWidth, reqHeight, minLayerZ, maxLayerZ, useIdentityTransform,
+            ISurfaceComposer::eRotateNone, SS_CPU_CONSUMER);
 }
 
 ScreenshotClient::ScreenshotClient()
@@ -887,7 +962,7 @@ status_t ScreenshotClient::update(const sp<IBinder>& display,
 
     status_t err = s->captureScreen(display, mProducer, sourceCrop,
             reqWidth, reqHeight, minLayerZ, maxLayerZ, useIdentityTransform,
-            static_cast<ISurfaceComposer::Rotation>(rotation));
+            static_cast<ISurfaceComposer::Rotation>(rotation), true);
 
     if (err == NO_ERROR) {
         err = mCpuConsumer->lockNextBuffer(&mBuffer);

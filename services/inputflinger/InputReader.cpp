@@ -3095,7 +3095,8 @@ void TouchInputMapper::configure(nsecs_t when,
     if (!changes || (changes & (InputReaderConfiguration::CHANGE_DISPLAY_INFO
             | InputReaderConfiguration::CHANGE_POINTER_GESTURE_ENABLEMENT
             | InputReaderConfiguration::CHANGE_SHOW_TOUCHES
-            | InputReaderConfiguration::CHANGE_EXTERNAL_STYLUS_PRESENCE))) {
+            | InputReaderConfiguration::CHANGE_EXTERNAL_STYLUS_PRESENCE
+            | InputReaderConfiguration::CHANGE_STYLUS_ICON_ENABLED))) {
         // Configure device sources, surface dimensions, orientation and
         // scaling factors.
         configureSurface(when, &resetNeeded);
@@ -3167,6 +3168,8 @@ void TouchInputMapper::configureParameters() {
             mParameters.deviceType = Parameters::DEVICE_TYPE_TOUCH_NAVIGATION;
         } else if (deviceTypeString == "pointer") {
             mParameters.deviceType = Parameters::DEVICE_TYPE_POINTER;
+        } else if (deviceTypeString == "gesture") {
+            mParameters.deviceType = Parameters::DEVICE_TYPE_GESTURE_SENSOR;
         } else if (deviceTypeString != "default") {
             ALOGW("Invalid value for touch.deviceType: '%s'", deviceTypeString.string());
         }
@@ -3221,6 +3224,9 @@ void TouchInputMapper::dumpParameters(String8& dump) {
         break;
     case Parameters::DEVICE_TYPE_POINTER:
         dump.append(INDENT4 "DeviceType: pointer\n");
+        break;
+    case Parameters::DEVICE_TYPE_GESTURE_SENSOR:
+        dump.append(INDENT4 "DeviceType: gesture\n");
         break;
     default:
         ALOG_ASSERT(false);
@@ -3284,6 +3290,9 @@ void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
     } else if (mParameters.deviceType == Parameters::DEVICE_TYPE_TOUCH_NAVIGATION) {
         mSource = AINPUT_SOURCE_TOUCH_NAVIGATION;
         mDeviceMode = DEVICE_MODE_NAVIGATION;
+    } else if (mParameters.deviceType == Parameters::DEVICE_TYPE_GESTURE_SENSOR) {
+        mSource = AINPUT_SOURCE_GESTURE_SENSOR;
+        mDeviceMode = DEVICE_MODE_UNSCALED;
     } else {
         mSource = AINPUT_SOURCE_TOUCHPAD;
         mDeviceMode = DEVICE_MODE_UNSCALED;
@@ -5021,7 +5030,7 @@ void TouchInputMapper::dispatchPointerGestures(nsecs_t when, uint32_t policyFlag
         if (mParameters.gestureMode == Parameters::GESTURE_MODE_MULTI_TOUCH
                 && mPointerGesture.lastGestureMode == PointerGesture::FREEFORM) {
             // Remind the user of where the pointer is after finishing a gesture with spots.
-            mPointerController->unfade(PointerControllerInterface::TRANSITION_GRADUAL);
+            unfadePointer(PointerControllerInterface::TRANSITION_GRADUAL);
         }
         break;
     case PointerGesture::TAP:
@@ -6024,6 +6033,7 @@ void TouchInputMapper::dispatchPointerStylus(nsecs_t when, uint32_t policyFlags)
         mPointerSimple.currentProperties.id = 0;
         mPointerSimple.currentProperties.toolType =
                 mCurrentCookedState.cookedPointerData.pointerProperties[index].toolType;
+        mLastStylusTime = when;
     } else {
         down = false;
         hovering = false;
@@ -6103,10 +6113,15 @@ void TouchInputMapper::dispatchPointerSimple(nsecs_t when, uint32_t policyFlags,
             mPointerController->setPresentation(PointerControllerInterface::PRESENTATION_POINTER);
             mPointerController->clearSpots();
             mPointerController->setButtonState(mCurrentRawState.buttonState);
-            mPointerController->unfade(PointerControllerInterface::TRANSITION_IMMEDIATE);
+            unfadePointer(PointerControllerInterface::TRANSITION_IMMEDIATE);
         } else if (!down && !hovering && (mPointerSimple.down || mPointerSimple.hovering)) {
             mPointerController->fade(PointerControllerInterface::TRANSITION_GRADUAL);
         }
+    }
+    
+    if (rejectPalm(when)) {     // stylus is currently active
+        mPointerSimple.reset();
+        return;
     }
 
     if (mPointerSimple.down && !down) {
@@ -6229,6 +6244,9 @@ void TouchInputMapper::dispatchMotion(nsecs_t when, uint32_t policyFlags, uint32
         const PointerProperties* properties, const PointerCoords* coords,
         const uint32_t* idToIndex, BitSet32 idBits, int32_t changedId,
         float xPrecision, float yPrecision, nsecs_t downTime) {
+    
+    if (rejectPalm(when)) return;
+    
     PointerCoords pointerCoords[MAX_POINTERS];
     PointerProperties pointerProperties[MAX_POINTERS];
     uint32_t pointerCount = 0;
@@ -6300,6 +6318,21 @@ void TouchInputMapper::fadePointer() {
     if (mPointerController != NULL) {
         mPointerController->fade(PointerControllerInterface::TRANSITION_GRADUAL);
     }
+}
+
+void TouchInputMapper::unfadePointer(PointerControllerInterface::Transition transition) {
+    if (mPointerController != NULL &&
+            !(mPointerUsage == POINTER_USAGE_STYLUS && !mConfig.stylusIconEnabled)) {
+        mPointerController->unfade(transition);
+    }
+}
+
+nsecs_t TouchInputMapper::mLastStylusTime = 0;
+
+bool TouchInputMapper::rejectPalm(nsecs_t when) {
+    return (when - mLastStylusTime < mConfig.stylusPalmRejectionTime) &&
+        mPointerSimple.currentProperties.toolType != AMOTION_EVENT_TOOL_TYPE_STYLUS &&
+        mPointerSimple.currentProperties.toolType != AMOTION_EVENT_TOOL_TYPE_ERASER;
 }
 
 void TouchInputMapper::cancelTouch(nsecs_t when) {

@@ -179,6 +179,12 @@ bool DisplayUtils::createV4L2BasedVirtualDisplay(HWComposer* hwc, int32_t &hwcDi
         if(hwc->setVirtualDisplayProperties(hwcDisplayId, w, h, format) != NO_ERROR)
             return false;
 #endif
+
+#ifndef USE_HWC2
+        if(hwc->setVirtualDisplayProperties(hwcDisplayId, w, h, format) != NO_ERROR)
+            return false;
+#endif
+
         dispSurface = new FramebufferSurface(*hwc, currentStateType, bqConsumer);
         producer = bqProducer;
         return true;
@@ -198,7 +204,7 @@ bool DisplayUtils::canAllocateHwcDisplayIdForVDS(int usage) {
     flag_mask = GRALLOC_USAGE_PRIVATE_WFD;
 #endif
 
-    return ((mHasWbNode) && (!allowHwcForVDS) && (usage & flag_mask));
+    return ((mHasWbNode) && (allowHwcForVDS || (usage & flag_mask)));
 }
 
 int DisplayUtils::getNumFbNodes() {

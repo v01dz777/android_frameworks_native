@@ -44,7 +44,7 @@ namespace android {
 // ---------------------------------------------------------------------------
 
 GLES20RenderEngine::GLES20RenderEngine() :
-        mVpWidth(0), mVpHeight(0) {
+        mVpWidth(0), mVpHeight(0), mProjectionRotation(Transform::ROT_0) {
 
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &mMaxTextureSize);
     glGetIntegerv(GL_MAX_VIEWPORT_DIMS, mMaxViewportDims);
@@ -125,6 +125,9 @@ void GLES20RenderEngine::setViewportAndProjection(
     mState.setProjectionMatrix(m);
     mVpWidth = vpw;
     mVpHeight = vph;
+    mProjectionSourceCrop = sourceCrop;
+    mProjectionYSwap = yswap;
+    mProjectionRotation = rotation;
 }
 
 #ifdef USE_HWC2
@@ -251,27 +254,44 @@ void GLES20RenderEngine::disableBlending() {
 
 
 void GLES20RenderEngine::bindImageAsFramebuffer(EGLImageKHR image,
-        uint32_t* texName, uint32_t* fbName, uint32_t* status) {
+        uint32_t* texName, uint32_t* fbName, uint32_t* status,
+        bool useReadPixels, int reqWidth, int reqHeight) {
     GLuint tname, name;
-    // turn our EGLImage into a texture
-    glGenTextures(1, &tname);
-    glBindTexture(GL_TEXTURE_2D, tname);
-    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+    if (!useReadPixels) {
+        // turn our EGLImage into a texture
+        glGenTextures(1, &tname);
+        glBindTexture(GL_TEXTURE_2D, tname);
+        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
 
-    // create a Framebuffer Object to render into
-    glGenFramebuffers(1, &name);
-    glBindFramebuffer(GL_FRAMEBUFFER, name);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tname, 0);
+        // create a Framebuffer Object to render into
+        glGenFramebuffers(1, &name);
+        glBindFramebuffer(GL_FRAMEBUFFER, name);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tname, 0);
+    } else {
+        // since we're going to use glReadPixels() anyways,
+        // use an intermediate renderbuffer instead
+        glGenRenderbuffers(1, &tname);
+        glBindRenderbuffer(GL_RENDERBUFFER, tname);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8_OES, reqWidth, reqHeight);
+        // create a FBO to render into
+        glGenFramebuffers(1, &name);
+        glBindFramebuffer(GL_FRAMEBUFFER, name);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, tname);
+    }
 
     *status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     *texName = tname;
     *fbName = name;
 }
 
-void GLES20RenderEngine::unbindFramebuffer(uint32_t texName, uint32_t fbName) {
+void GLES20RenderEngine::unbindFramebuffer(uint32_t texName, uint32_t fbName,
+        bool useReadPixels) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDeleteFramebuffers(1, &fbName);
-    glDeleteTextures(1, &texName);
+    if (!useReadPixels)
+        glDeleteTextures(1, &texName);
+    else
+        glDeleteRenderbuffers(1, &texName);
 }
 
 void GLES20RenderEngine::setupFillWithColor(float r, float g, float b, float a) {
@@ -311,6 +331,30 @@ void GLES20RenderEngine::drawMesh(const Mesh& mesh) {
 
 void GLES20RenderEngine::dump(String8& result) {
     RenderEngine::dump(result);
+}
+
+void GLES20RenderEngine::setupLayerMasking(const Texture& maskTexture, float alphaThreshold) {
+    glActiveTexture(GL_TEXTURE0 + 1);
+    GLuint target = maskTexture.getTextureTarget();
+    glBindTexture(target, maskTexture.getTextureName());
+    GLenum filter = GL_NEAREST;
+    if (maskTexture.getFiltering()) {
+        filter = GL_LINEAR;
+    }
+    glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, filter);
+    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, filter);
+
+    if (alphaThreshold < 0) alphaThreshold = 0;
+    if (alphaThreshold > 1.0f) alphaThreshold = 1.0f;
+
+    mState.setMasking(maskTexture, alphaThreshold);
+    glActiveTexture(GL_TEXTURE0);
+}
+
+void GLES20RenderEngine::disableLayerMasking() {
+    mState.disableMasking();
 }
 
 // ---------------------------------------------------------------------------
