@@ -175,6 +175,9 @@ ifeq ($(TARGET_USES_QCOM_BSP), true)
     ExSurfaceFlinger/ExVirtualDisplaySurface.cpp \
     ExSurfaceFlinger/ExHWComposer.cpp
   endif
+  ifeq ($(TARGET_USES_COLOR_METADATA), true)
+    LOCAL_CFLAGS += -DUSE_COLOR_METADATA
+  endif
 endif
 
 ifeq ($(BOARD_USES_HWC_SERVICES), true)
